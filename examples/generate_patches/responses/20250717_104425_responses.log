@@ -1,0 +1,1402 @@
+2025-07-17 10:44:25,744 - --- REQUEST ---
+<Instruction>
+    You are an expert software engineer specializing in security.
+    Based on the provided root cause analysis and the vulnerable code, rewrite the entire code to fix the vulnerability.
+    
+Follow these patch design steps:
+1. 불일치 제거를 통한 일관성 확보: 위임에 사용되는 타입과 검증 및 유추에 사용된 타입 간의 일관성을 유지하도록 수정합니다. 이를 통해, 시스템이 예상치 못한 객체를 인스턴스화하지 않도록 합니다.
+2. 신뢰할 수 있는 타입의 명시적 사용: 외부에서 유도된 타입(componentType)을 직접 사용함으로써, 내부에서 타입이 조작되거나 변경될 가능성을 차단합니다. 명확하게 정의된 타입 체계를 따르도록 로직을 단순화합니다.
+3. 입력 기반 타입 유추 제거 또는 제한: 가능하다면 외부 입력에서 유도되는 타입 유추 로직 자체를 제거하거나, 내부적으로 허용된 타입만 허용하도록 제한하여, 안전한 역직렬화 프로세스를 확보합니다.
+4. 타입 유추 과정 검증 강화: GenericArrayType이나 TypeVariable에서 유도된 타입의 경우에도, 그 최종 결과가 신뢰할 수 있는지 검증하도록 설계하여, 타입 정보 기반 공격 가능성을 낮춥니다.
+
+    **VERY IMPORTANT RULES:**
+    1.  You MUST output the COMPLETE, modified Java code for the file.
+    2.  The code must be syntactically correct and compilable.
+    3.  Do NOT output a `diff` or a patch. Output the entire file content.
+
+    Output ONLY the code content within <PatchedCode> and </PatchedCode> tags.
+    </Instruction>
+    <Root Cause Analysis>Root Cause Analysis Report
+Component: ObjectArrayCodec.java
+Vulnerability ID: CWE-20 – Improper Input Validation
+Context: Deserialization of JSON arrays to Java object arrays
+
+Overview
+This report analyzes the vulnerability present in the method:
+
+```java
+public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName)
+in the ObjectArrayCodec class of Fastjson. The core issue lies in the improper validation of types during deserialization, enabling potential unsafe type resolution and object creation based on attacker-controlled input.
+```
+
+Vulnerability Summary
+Field	Description
+CWE ID	CWE-20
+Title	Improper Input Validation
+Root Cause	Failure to restrict componentClass derivation and unchecked deserialization
+Attack Vector	JSON input with unexpected or malicious structure
+Impact	Potential gadget deserialization → RCE
+Vulnerable Code	parser.parseArray(componentClass, array, fieldName);
+
+Root Cause Details
+Vulnerable Behavior
+In the following vulnerable statement:
+
+```java
+parser.parseArray(componentClass, array, fieldName);
+The componentClass is derived dynamically from user-supplied type information:
+```
+
+```java
+componentClass = TypeUtils.getClass(componentType);
+No input validation or type restrictions are applied before this class is used to instantiate array elements.
+
+The parser proceeds to deserialize attacker-controlled data using this potentially unsafe class type.
+```
+
+Dangerous Consequences
+If componentClass resolves to a sensitive or dangerous class (e.g., from JDK, 3rd-party libraries with side-effects), an attacker can inject a crafted JSON array that leads to:
+
+Instantiation of unwanted classes.
+
+Triggering of deserialization gadgets.
+
+Remote Code Execution (RCE) if gadget chains exist.
+
+Technical Flow of the Vulnerability
+plaintext
+┌────────────────────────────────────────────┐
+│ JSON input with attacker-controlled types  │
+└────────────────────────────────────────────┘
+                    ↓
+     parser.parseArray(componentClass, …)
+                    ↓
+  TypeUtils.cast(value, componentType, …)
+                    ↓
+  ↪ Unchecked reflection + type resolution
+                    ↓
+  ↪ Insecure object creation
+                    ↓
+ ⚠  Possible invocation of gadget methods
+                    ↓
+RCE / arbitrary code execution
+Why This is CWE-20
+CWE-20 (Improper Input Validation) is defined as:
+"The product does not validate or incorrectly validates input that can affect the control flow or data flow of a program."
+
+In this case:
+
+The product accepts JSON input that ultimately controls how Java objects are created.
+
+There is no validation of the target component class, allowing unsafe or malicious input to control control/data flow.
+
+The method lacks any security check, allowlist, or safeguard prior to parsing attacker-controlled JSON arrays into Java arrays.
+
+Human Patch (Intended Fix)
+While the patched code looks identical in this snippet, the actual defense in Fastjson's real fix is implemented outside this class — typically via:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+ParserConfig.getGlobalInstance().addAccept("com.myapp.models.");
+This enforces allowlisting of safe types and disables auto type resolution — both critical protections missing in the vulnerable context.
+```
+
+Recommendations
+Mitigation (code-level)
+Introduce allowlisting of componentClass before calling parseArray.
+
+Reject any dynamic or reflective resolution that points to system or untrusted types.
+
+System-wide Safeguard
+In ParserConfig, enforce:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+or whitelist specific packages:
+```
+```java
+ParserConfig.getGlobalInstance().addAccept("com.safe.package.");
+```Conclusion
+The vulnerable code in ObjectArrayCodec fails to validate the class used for deserializing array elements, enabling unsafe type casting and recursive deserialization through user-supplied input. This classic case of CWE-20 can lead to serious consequences, including deserialization attacks and RCE if proper type constraints and parsing protections are not applied.
+```</Root Cause Analysis>
+    <Vulnerable Code>
+    ```java
+    package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    if (actualType instanceof Class) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        componentClass = Object.class;
+                    }
+                } else {
+                    componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                }
+            } else {
+                componentClass = TypeUtils.getClass(componentType);
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+
+    ```
+    </Vulnerable Code>
+    <PatchedCode>
+    
+
+2025-07-17 10:44:45,573 - --- RESPONSE ---
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    private static final Set<Class<?>> SAFE_CLASSES;
+
+    static {
+      SAFE_CLASSES = new HashSet<>();
+      SAFE_CLASSES.add(Integer.class);
+      SAFE_CLASSES.add(Boolean.class);
+      SAFE_CLASSES.add(String.class);
+      SAFE_CLASSES.add(Double.class);
+      SAFE_CLASSES.add(Float.class);
+      SAFE_CLASSES.add(Byte.class);
+      SAFE_CLASSES.add(Long.class);
+      SAFE_CLASSES.add(Short.class);
+      // you can add more safe classes as per your need
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    // verification of the class type
+                    if (actualType instanceof Class && SAFE_CLASSES.contains(actualType)) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                } else {
+                    // verification of the class type
+                    if(SAFE_CLASSES.contains(typeVar.getBounds()[0])) {
+                        componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                }
+            } else {
+                // verification of the class type
+                if(SAFE_CLASSES.contains(componentType)) {
+                    componentClass = TypeUtils.getClass(componentType);
+                } else {
+                    // if dangerous or uncommon class type, throw an exception
+                    throw new SecurityException("Dangerous class type in JSON input");
+                }
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+```
+    </PatchedCode>
+
+2025-07-17 10:44:45,574 - --- REQUEST ---
+<Instruction>
+You are a senior software engineer and security expert.
+Your task is to evaluate a generated code solution based on the original vulnerability and code.
+Provide a score from 1 to 10 based on the following criteria:
+1.  **Vulnerability Fix (Weight: 30%)**: Does the new code correctly and completely fix the described vulnerability?
+2.  **Correctness (Weight: 25%)**: Is the code syntactically correct and free of obvious bugs? Does it preserve the original functionality?
+3.  **Code Quality (Weight: 25%)**: Is the code clean, well-structured, and maintainable?
+4.  **Minimality of Change (Weight: 20%)**: Can the vulnerability be fixed with the minimal necessary code modifications, avoiding unnecessary changes?
+
+Your output MUST be a JSON object with two keys: "score" (a float from 1.0 to 10.0) and "rationale" (a brief explanation for your score, in one or two sentences).
+Example:
+{
+    "score": 8.5,
+    "rationale": "The patch effectively addresses the vulnerability by adding input validation, but the hard-coded safe class list could be more flexible.",
+}
+
+<Root Cause Analysis>Root Cause Analysis Report
+Component: ObjectArrayCodec.java
+Vulnerability ID: CWE-20 – Improper Input Validation
+Context: Deserialization of JSON arrays to Java object arrays
+
+Overview
+This report analyzes the vulnerability present in the method:
+
+```java
+public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName)
+in the ObjectArrayCodec class of Fastjson. The core issue lies in the improper validation of types during deserialization, enabling potential unsafe type resolution and object creation based on attacker-controlled input.
+```
+
+Vulnerability Summary
+Field	Description
+CWE ID	CWE-20
+Title	Improper Input Validation
+Root Cause	Failure to restrict componentClass derivation and unchecked deserialization
+Attack Vector	JSON input with unexpected or malicious structure
+Impact	Potential gadget deserialization → RCE
+Vulnerable Code	parser.parseArray(componentClass, array, fieldName);
+
+Root Cause Details
+Vulnerable Behavior
+In the following vulnerable statement:
+
+```java
+parser.parseArray(componentClass, array, fieldName);
+The componentClass is derived dynamically from user-supplied type information:
+```
+
+```java
+componentClass = TypeUtils.getClass(componentType);
+No input validation or type restrictions are applied before this class is used to instantiate array elements.
+
+The parser proceeds to deserialize attacker-controlled data using this potentially unsafe class type.
+```
+
+Dangerous Consequences
+If componentClass resolves to a sensitive or dangerous class (e.g., from JDK, 3rd-party libraries with side-effects), an attacker can inject a crafted JSON array that leads to:
+
+Instantiation of unwanted classes.
+
+Triggering of deserialization gadgets.
+
+Remote Code Execution (RCE) if gadget chains exist.
+
+Technical Flow of the Vulnerability
+plaintext
+┌────────────────────────────────────────────┐
+│ JSON input with attacker-controlled types  │
+└────────────────────────────────────────────┘
+                    ↓
+     parser.parseArray(componentClass, …)
+                    ↓
+  TypeUtils.cast(value, componentType, …)
+                    ↓
+  ↪ Unchecked reflection + type resolution
+                    ↓
+  ↪ Insecure object creation
+                    ↓
+ ⚠  Possible invocation of gadget methods
+                    ↓
+RCE / arbitrary code execution
+Why This is CWE-20
+CWE-20 (Improper Input Validation) is defined as:
+"The product does not validate or incorrectly validates input that can affect the control flow or data flow of a program."
+
+In this case:
+
+The product accepts JSON input that ultimately controls how Java objects are created.
+
+There is no validation of the target component class, allowing unsafe or malicious input to control control/data flow.
+
+The method lacks any security check, allowlist, or safeguard prior to parsing attacker-controlled JSON arrays into Java arrays.
+
+Human Patch (Intended Fix)
+While the patched code looks identical in this snippet, the actual defense in Fastjson's real fix is implemented outside this class — typically via:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+ParserConfig.getGlobalInstance().addAccept("com.myapp.models.");
+This enforces allowlisting of safe types and disables auto type resolution — both critical protections missing in the vulnerable context.
+```
+
+Recommendations
+Mitigation (code-level)
+Introduce allowlisting of componentClass before calling parseArray.
+
+Reject any dynamic or reflective resolution that points to system or untrusted types.
+
+System-wide Safeguard
+In ParserConfig, enforce:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+or whitelist specific packages:
+```
+```java
+ParserConfig.getGlobalInstance().addAccept("com.safe.package.");
+```Conclusion
+The vulnerable code in ObjectArrayCodec fails to validate the class used for deserializing array elements, enabling unsafe type casting and recursive deserialization through user-supplied input. This classic case of CWE-20 can lead to serious consequences, including deserialization attacks and RCE if proper type constraints and parsing protections are not applied.
+```</Root Cause Analysis>
+<Vulnerable Code>
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    if (actualType instanceof Class) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        componentClass = Object.class;
+                    }
+                } else {
+                    componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                }
+            } else {
+                componentClass = TypeUtils.getClass(componentType);
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+
+```
+</Vulnerable Code>
+<Generated Code>
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    private static final Set<Class<?>> SAFE_CLASSES;
+
+    static {
+      SAFE_CLASSES = new HashSet<>();
+      SAFE_CLASSES.add(Integer.class);
+      SAFE_CLASSES.add(Boolean.class);
+      SAFE_CLASSES.add(String.class);
+      SAFE_CLASSES.add(Double.class);
+      SAFE_CLASSES.add(Float.class);
+      SAFE_CLASSES.add(Byte.class);
+      SAFE_CLASSES.add(Long.class);
+      SAFE_CLASSES.add(Short.class);
+      // you can add more safe classes as per your need
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    // verification of the class type
+                    if (actualType instanceof Class && SAFE_CLASSES.contains(actualType)) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                } else {
+                    // verification of the class type
+                    if(SAFE_CLASSES.contains(typeVar.getBounds()[0])) {
+                        componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                }
+            } else {
+                // verification of the class type
+                if(SAFE_CLASSES.contains(componentType)) {
+                    componentClass = TypeUtils.getClass(componentType);
+                } else {
+                    // if dangerous or uncommon class type, throw an exception
+                    throw new SecurityException("Dangerous class type in JSON input");
+                }
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+```
+</Generated Code>
+<Evaluation>
+
+
+2025-07-17 10:44:48,858 - --- RESPONSE ---
+{"score": 8.4, "rationale": "The generated fix addresses the core vulnerability by introducing an allowlist of safe classes, which prevents instantiation of potentially harmful classes. It maintains the original functionality, but the addition of an arbitrary allowlist within the function doesn't follow best practices for code maintainability as it may need to be replicated in other places. Minimal changes were made and the structure of code is generally good."}
+
+2025-07-17 10:44:48,862 - --- REQUEST ---
+<Instruction>
+You are a master software architect and security expert.
+You have been provided with several previously generated candidate solutions, all of which are compilable.
+Your task is to analyze each solution, considering not only its assigned score but also its detailed rationale and content, to synthesize a single, optimal and superior final version of the code. This final version must incorporate the best ideas and insights from all candidates.
+Here are the criteria for evaluating the code:
+Refer to relevant patches, but you don't need to if you deem them unnecessary.
+
+Here are the criteria for evaluating the code:
+1.  **Vulnerability Fix (Weight: 30%)**: Does the new code correctly and completely fix the described vulnerability?
+2.  **Correctness (Weight: 25%)**: Is the code syntactically correct and free of obvious bugs? Does it preserve the original functionality?
+3.  **Code Quality (Weight: 25%)**: Is the code clean, well-structured, and maintainable?
+4.  **Minimality of Change (Weight: 20%)**: Can the vulnerability be fixed with the minimal necessary code modifications, avoiding unnecessary changes?
+The final output must be the complete, final Java code.
+Output the final, synthesized code within <FinalCode> and </FinalCode> tags.
+</Instruction>
+<Root Cause Analysis>Root Cause Analysis Report
+Component: ObjectArrayCodec.java
+Vulnerability ID: CWE-20 – Improper Input Validation
+Context: Deserialization of JSON arrays to Java object arrays
+
+Overview
+This report analyzes the vulnerability present in the method:
+
+```java
+public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName)
+in the ObjectArrayCodec class of Fastjson. The core issue lies in the improper validation of types during deserialization, enabling potential unsafe type resolution and object creation based on attacker-controlled input.
+```
+
+Vulnerability Summary
+Field	Description
+CWE ID	CWE-20
+Title	Improper Input Validation
+Root Cause	Failure to restrict componentClass derivation and unchecked deserialization
+Attack Vector	JSON input with unexpected or malicious structure
+Impact	Potential gadget deserialization → RCE
+Vulnerable Code	parser.parseArray(componentClass, array, fieldName);
+
+Root Cause Details
+Vulnerable Behavior
+In the following vulnerable statement:
+
+```java
+parser.parseArray(componentClass, array, fieldName);
+The componentClass is derived dynamically from user-supplied type information:
+```
+
+```java
+componentClass = TypeUtils.getClass(componentType);
+No input validation or type restrictions are applied before this class is used to instantiate array elements.
+
+The parser proceeds to deserialize attacker-controlled data using this potentially unsafe class type.
+```
+
+Dangerous Consequences
+If componentClass resolves to a sensitive or dangerous class (e.g., from JDK, 3rd-party libraries with side-effects), an attacker can inject a crafted JSON array that leads to:
+
+Instantiation of unwanted classes.
+
+Triggering of deserialization gadgets.
+
+Remote Code Execution (RCE) if gadget chains exist.
+
+Technical Flow of the Vulnerability
+plaintext
+┌────────────────────────────────────────────┐
+│ JSON input with attacker-controlled types  │
+└────────────────────────────────────────────┘
+                    ↓
+     parser.parseArray(componentClass, …)
+                    ↓
+  TypeUtils.cast(value, componentType, …)
+                    ↓
+  ↪ Unchecked reflection + type resolution
+                    ↓
+  ↪ Insecure object creation
+                    ↓
+ ⚠  Possible invocation of gadget methods
+                    ↓
+RCE / arbitrary code execution
+Why This is CWE-20
+CWE-20 (Improper Input Validation) is defined as:
+"The product does not validate or incorrectly validates input that can affect the control flow or data flow of a program."
+
+In this case:
+
+The product accepts JSON input that ultimately controls how Java objects are created.
+
+There is no validation of the target component class, allowing unsafe or malicious input to control control/data flow.
+
+The method lacks any security check, allowlist, or safeguard prior to parsing attacker-controlled JSON arrays into Java arrays.
+
+Human Patch (Intended Fix)
+While the patched code looks identical in this snippet, the actual defense in Fastjson's real fix is implemented outside this class — typically via:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+ParserConfig.getGlobalInstance().addAccept("com.myapp.models.");
+This enforces allowlisting of safe types and disables auto type resolution — both critical protections missing in the vulnerable context.
+```
+
+Recommendations
+Mitigation (code-level)
+Introduce allowlisting of componentClass before calling parseArray.
+
+Reject any dynamic or reflective resolution that points to system or untrusted types.
+
+System-wide Safeguard
+In ParserConfig, enforce:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+or whitelist specific packages:
+```
+```java
+ParserConfig.getGlobalInstance().addAccept("com.safe.package.");
+```Conclusion
+The vulnerable code in ObjectArrayCodec fails to validate the class used for deserializing array elements, enabling unsafe type casting and recursive deserialization through user-supplied input. This classic case of CWE-20 can lead to serious consequences, including deserialization attacks and RCE if proper type constraints and parsing protections are not applied.
+```</Root Cause Analysis>
+<Vulnerable Code>
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    if (actualType instanceof Class) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        componentClass = Object.class;
+                    }
+                } else {
+                    componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                }
+            } else {
+                componentClass = TypeUtils.getClass(componentType);
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+
+```
+</Vulnerable Code>
+<Validated Candidate Solutions>
+--- Candidate Solution 1 (Score: 8.4) ---
+Rationale: The generated fix addresses the core vulnerability by introducing an allowlist of safe classes, which prevents instantiation of potentially harmful classes. It maintains the original functionality, but the addition of an arbitrary allowlist within the function doesn't follow best practices for code maintainability as it may need to be replicated in other places. Minimal changes were made and the structure of code is generally good.
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    private static final Set<Class<?>> SAFE_CLASSES;
+
+    static {
+      SAFE_CLASSES = new HashSet<>();
+      SAFE_CLASSES.add(Integer.class);
+      SAFE_CLASSES.add(Boolean.class);
+      SAFE_CLASSES.add(String.class);
+      SAFE_CLASSES.add(Double.class);
+      SAFE_CLASSES.add(Float.class);
+      SAFE_CLASSES.add(Byte.class);
+      SAFE_CLASSES.add(Long.class);
+      SAFE_CLASSES.add(Short.class);
+      // you can add more safe classes as per your need
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    // verification of the class type
+                    if (actualType instanceof Class && SAFE_CLASSES.contains(actualType)) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                } else {
+                    // verification of the class type
+                    if(SAFE_CLASSES.contains(typeVar.getBounds()[0])) {
+                        componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                }
+            } else {
+                // verification of the class type
+                if(SAFE_CLASSES.contains(componentType)) {
+                    componentClass = TypeUtils.getClass(componentType);
+                } else {
+                    // if dangerous or uncommon class type, throw an exception
+                    throw new SecurityException("Dangerous class type in JSON input");
+                }
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+```
+</Validated Candidate Solutions>
+<FinalCode>
+
+
+2025-07-17 10:45:15,312 - --- RESPONSE ---
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    private static final Set<Class<?>> SAFE_CLASSES;
+
+    static {
+      SAFE_CLASSES = new HashSet<>();
+      SAFE_CLASSES.add(Integer.class);
+      SAFE_CLASSES.add(Boolean.class);
+      SAFE_CLASSES.add(String.class);
+      SAFE_CLASSES.add(Double.class);
+      SAFE_CLASSES.add(Float.class);
+      SAFE_CLASSES.add(Byte.class);
+      SAFE_CLASSES.add(Long.class);
+      SAFE_CLASSES.add(Short.class);
+      // you can add more safe classes as per your need
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    // verification of the class type
+                    if (actualType instanceof Class && SAFE_CLASSES.contains(actualType)) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                } else {
+                    // verification of the class type
+                    if(SAFE_CLASSES.contains(typeVar.getBounds()[0])) {
+                        componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                }
+            } else {
+                // verification of the class type
+                if(SAFE_CLASSES.contains(componentType)) {
+                    componentClass = TypeUtils.getClass(componentType);
+                } else {
+                    // if dangerous or uncommon class type, throw an exception
+                    throw new SecurityException("Dangerous class type in JSON input");
+                }
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+```
+</FinalCode>
+
+2025-07-17 10:45:15,313 - --- REQUEST ---
+<Instruction>
+You are a senior software engineer and security expert.
+Your task is to evaluate a generated code solution based on the original vulnerability and code.
+Provide a score from 1 to 10 based on the following criteria:
+1.  **Vulnerability Fix (Weight: 30%)**: Does the new code correctly and completely fix the described vulnerability?
+2.  **Correctness (Weight: 25%)**: Is the code syntactically correct and free of obvious bugs? Does it preserve the original functionality?
+3.  **Code Quality (Weight: 25%)**: Is the code clean, well-structured, and maintainable?
+4.  **Minimality of Change (Weight: 20%)**: Can the vulnerability be fixed with the minimal necessary code modifications, avoiding unnecessary changes?
+
+Your output MUST be a JSON object with two keys: "score" (a float from 1.0 to 10.0) and "rationale" (a brief explanation for your score, in one or two sentences).
+Example:
+{
+    "score": 8.5,
+    "rationale": "The patch effectively addresses the vulnerability by adding input validation, but the hard-coded safe class list could be more flexible.",
+}
+
+<Root Cause Analysis>Root Cause Analysis Report
+Component: ObjectArrayCodec.java
+Vulnerability ID: CWE-20 – Improper Input Validation
+Context: Deserialization of JSON arrays to Java object arrays
+
+Overview
+This report analyzes the vulnerability present in the method:
+
+```java
+public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName)
+in the ObjectArrayCodec class of Fastjson. The core issue lies in the improper validation of types during deserialization, enabling potential unsafe type resolution and object creation based on attacker-controlled input.
+```
+
+Vulnerability Summary
+Field	Description
+CWE ID	CWE-20
+Title	Improper Input Validation
+Root Cause	Failure to restrict componentClass derivation and unchecked deserialization
+Attack Vector	JSON input with unexpected or malicious structure
+Impact	Potential gadget deserialization → RCE
+Vulnerable Code	parser.parseArray(componentClass, array, fieldName);
+
+Root Cause Details
+Vulnerable Behavior
+In the following vulnerable statement:
+
+```java
+parser.parseArray(componentClass, array, fieldName);
+The componentClass is derived dynamically from user-supplied type information:
+```
+
+```java
+componentClass = TypeUtils.getClass(componentType);
+No input validation or type restrictions are applied before this class is used to instantiate array elements.
+
+The parser proceeds to deserialize attacker-controlled data using this potentially unsafe class type.
+```
+
+Dangerous Consequences
+If componentClass resolves to a sensitive or dangerous class (e.g., from JDK, 3rd-party libraries with side-effects), an attacker can inject a crafted JSON array that leads to:
+
+Instantiation of unwanted classes.
+
+Triggering of deserialization gadgets.
+
+Remote Code Execution (RCE) if gadget chains exist.
+
+Technical Flow of the Vulnerability
+plaintext
+┌────────────────────────────────────────────┐
+│ JSON input with attacker-controlled types  │
+└────────────────────────────────────────────┘
+                    ↓
+     parser.parseArray(componentClass, …)
+                    ↓
+  TypeUtils.cast(value, componentType, …)
+                    ↓
+  ↪ Unchecked reflection + type resolution
+                    ↓
+  ↪ Insecure object creation
+                    ↓
+ ⚠  Possible invocation of gadget methods
+                    ↓
+RCE / arbitrary code execution
+Why This is CWE-20
+CWE-20 (Improper Input Validation) is defined as:
+"The product does not validate or incorrectly validates input that can affect the control flow or data flow of a program."
+
+In this case:
+
+The product accepts JSON input that ultimately controls how Java objects are created.
+
+There is no validation of the target component class, allowing unsafe or malicious input to control control/data flow.
+
+The method lacks any security check, allowlist, or safeguard prior to parsing attacker-controlled JSON arrays into Java arrays.
+
+Human Patch (Intended Fix)
+While the patched code looks identical in this snippet, the actual defense in Fastjson's real fix is implemented outside this class — typically via:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+ParserConfig.getGlobalInstance().addAccept("com.myapp.models.");
+This enforces allowlisting of safe types and disables auto type resolution — both critical protections missing in the vulnerable context.
+```
+
+Recommendations
+Mitigation (code-level)
+Introduce allowlisting of componentClass before calling parseArray.
+
+Reject any dynamic or reflective resolution that points to system or untrusted types.
+
+System-wide Safeguard
+In ParserConfig, enforce:
+
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(false);
+or whitelist specific packages:
+```
+```java
+ParserConfig.getGlobalInstance().addAccept("com.safe.package.");
+```Conclusion
+The vulnerable code in ObjectArrayCodec fails to validate the class used for deserializing array elements, enabling unsafe type casting and recursive deserialization through user-supplied input. This classic case of CWE-20 can lead to serious consequences, including deserialization attacks and RCE if proper type constraints and parsing protections are not applied.
+```</Root Cause Analysis>
+<Vulnerable Code>
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    if (actualType instanceof Class) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        componentClass = Object.class;
+                    }
+                } else {
+                    componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                }
+            } else {
+                componentClass = TypeUtils.getClass(componentType);
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+
+```
+</Vulnerable Code>
+<Generated Code>
+```java
+package com.alibaba.fastjson.serializer;
+
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.parser.DefaultJSONParser;
+import com.alibaba.fastjson.parser.JSONLexer;
+import com.alibaba.fastjson.parser.JSONToken;
+import com.alibaba.fastjson.parser.deserializer.ObjectDeserializer;
+import com.alibaba.fastjson.util.TypeUtils;
+
+public class ObjectArrayCodec implements ObjectSerializer, ObjectDeserializer {
+
+    private static final Set<Class<?>> SAFE_CLASSES;
+
+    static {
+      SAFE_CLASSES = new HashSet<>();
+      SAFE_CLASSES.add(Integer.class);
+      SAFE_CLASSES.add(Boolean.class);
+      SAFE_CLASSES.add(String.class);
+      SAFE_CLASSES.add(Double.class);
+      SAFE_CLASSES.add(Float.class);
+      SAFE_CLASSES.add(Byte.class);
+      SAFE_CLASSES.add(Long.class);
+      SAFE_CLASSES.add(Short.class);
+      // you can add more safe classes as per your need
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+        final JSONLexer lexer = parser.lexer;
+        if (lexer.token() == JSONToken.NULL) {
+            lexer.nextToken(JSONToken.COMMA);
+            return null;
+        }
+
+        if (lexer.token() == JSONToken.LITERAL_STRING) {
+            byte[] bytes = lexer.bytesValue();
+            lexer.nextToken(JSONToken.COMMA);
+            return (T) bytes;
+        }
+
+        Class componentClass;
+        Type componentType;
+
+        if (type instanceof GenericArrayType) {
+            GenericArrayType clazz = (GenericArrayType) type;
+            componentType = clazz.getGenericComponentType();
+
+            if (componentType instanceof TypeVariable) {
+                TypeVariable typeVar = (TypeVariable) componentType;
+                Type objType = parser.getContext().type;
+
+                if (objType instanceof ParameterizedType) {
+                    ParameterizedType objParamType = (ParameterizedType) objType;
+                    Type objRawType = objParamType.getRawType();
+                    Type actualType = null;
+
+                    if (objRawType instanceof Class) {
+                        TypeVariable[] objTypeParams = ((Class) objRawType).getTypeParameters();
+                        for (int i = 0; i < objTypeParams.length; ++i) {
+                            if (objTypeParams[i].getName().equals(typeVar.getName())) {
+                                actualType = objParamType.getActualTypeArguments()[i];
+                            }
+                        }
+                    }
+
+                    // verification of the class type
+                    if (actualType instanceof Class && SAFE_CLASSES.contains(actualType)) {
+                        componentClass = (Class) actualType;
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                } else {
+                    // verification of the class type
+                    if(SAFE_CLASSES.contains(typeVar.getBounds()[0])) {
+                        componentClass = TypeUtils.getClass(typeVar.getBounds()[0]);
+                    } else {
+                        // if dangerous or uncommon class type, throw an exception
+                        throw new SecurityException("Dangerous class type in JSON input");
+                    }
+                }
+            } else {
+                // verification of the class type
+                if(SAFE_CLASSES.contains(componentType)) {
+                    componentClass = TypeUtils.getClass(componentType);
+                } else {
+                    // if dangerous or uncommon class type, throw an exception
+                    throw new SecurityException("Dangerous class type in JSON input");
+                }
+            }
+        } else {
+            Class clazz = (Class) type;
+            componentType = componentClass = clazz.getComponentType();
+        }
+
+        JSONArray array = new JSONArray();
+        parser.parseArray(componentClass, array, fieldName);
+
+        return (T) toObjectArray(parser, componentClass, array);
+    }
+}
+```
+</Generated Code>
+<Evaluation>
+
+
+2025-07-17 10:45:19,957 - --- RESPONSE ---
+{
+    "score": 8.8,
+    "rationale": "The fix enforces an allowlist check on the class type before deserializing the JSON, effectively mitigating the vulnerability. The code is syntactically correct, but the allowlist could be made more flexible instead of hardcoding safe classes. The changes are minimal and only affect the affected code segment."
+}
+
+

@@ -1,0 +1,22 @@
+Root Cause Analysis of CWE-20 in AddOperation
+The vulnerability (CWE-20: Improper Input Validation) in the AddOperation class, as indicated by the provided code changes, is located within the evaluateValueFromTarget method. The root cause of this vulnerability is the unsafe and incomplete sanitization of the JSON Patch path before it is used to construct a PropertyPath for reflective access.
+
+The Core Problem: Unsafe Path Construction for Property Access
+Before the patch, when the path ended with "-" (indicating an "add to end of collection" operation), the evaluateValueFromTarget method attempted to derive a pathSource for creating a PropertyPath. It did this by splitting the path string, filtering out numeric segments and the "-" character, and then rejoining the remaining parts with ".". This custom parsing and sanitization logic was insufficient and could be bypassed or manipulated.
+
+Specific Vulnerabilities Arising from Improper Path Sanitization:
+Arbitrary PropertyPath Construction:
+
+The original filtering logic (.filter(it -> !it.matches("\\d")) and .filter(it -> !it.equals("-"))) was designed to remove array indices and the "add to end" token. However, it did not comprehensively sanitize or validate other characters or sequences that might be present in the path string.
+
+An attacker could craft a path that, after this incomplete filtering, would result in a pathSource string that resolves to an unintended PropertyPath on the targetObject. For example, if the path contained characters that were not digits or "-", but were also not valid property name characters in the context of PropertyPath.from, it could lead to unexpected behavior. More critically, if the filtering logic missed certain characters or patterns, an attacker could potentially inject parts of a path that would allow access to or modification of properties not intended to be exposed via JSON Patch.
+
+Bypassing Access Controls or Business Logic:
+
+By manipulating the path to target an unintended PropertyPath, an attacker could potentially bypass application-level access controls or business logic that assumes the path is always well-formed and points to an expected location. This could allow for:
+
+Unauthorized Data Modification: Modifying sensitive properties that should not be directly accessible via JSON Patch operations.
+
+Denial of Service: Crafting a path that leads to an invalid PropertyPath creation or a NullPointerException or other runtime errors, causing the application to crash or behave unpredictably.
+
+The patch addresses this by replacing the manual and error-prone path parsing with a call to verifyPath(entityType). This new approach likely leverages a more robust and secure mechanism (presumably provided by the PropertyPath or related framework components) to validate and resolve the path against the entityType. By delegating path validation to a dedicated and presumably more secure method, the vulnerability of improper input sanitization in evaluateValueFromTarget is mitigated.

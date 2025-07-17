@@ -1,0 +1,39 @@
+Root Cause Analysis of CWE-22 in DefaultURLConstructor
+The vulnerability (CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')) in the DefaultURLConstructor class, as indicated by the provided code changes, is located within the getForwardPage method. The root cause of this vulnerability is the direct use of user-controlled input (request.getPathInfo()) to determine an internal forward path without proper validation or sanitization.
+
+Understanding CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
+CWE-22 describes a vulnerability where an application uses user-supplied input to construct a pathname (file or directory path) without neutralizing or incorrectly neutralizing special elements within the pathname. These special elements, such as ".." (dot-dot-slash) or absolute path indicators, can allow an attacker to access or manipulate files and directories outside of the intended or restricted directory. This can lead to:
+
+Unauthorized File Access: Reading sensitive files (e.g., configuration files, password files).
+
+Unauthorized File Creation/Modification/Deletion: Writing to arbitrary locations, potentially overwriting critical system files or injecting malicious code.
+
+Arbitrary Code Execution: If the attacker can write to a location from which executable code is loaded.
+
+The Core Problem: Unsanitized request.getPathInfo() in getForwardPage
+The getForwardPage method in the original code directly returns the value of request.getPathInfo():
+
+public String getForwardPage( HttpServletRequest request ) {
+    return request.getPathInfo(); // <-- PROBLEM HERE: Direct use of user input
+}
+
+The HttpServletRequest.getPathInfo() method returns any extra path information associated with the URL request, which comes after the servlet path but before the query string. This information is controlled by the client (user).
+
+Specific Vulnerabilities Arising from Unsanitized Input:
+Arbitrary File Access/Traversal:
+
+If the getForwardPage method's return value is subsequently used by the application to construct a file path for an internal server-side forward or resource loading (e.g., loading a JSP page, a template, or a configuration file), an attacker could supply a malicious PathInfo.
+
+For example, if an attacker requests a URL like http://example.com/servlet/../WEB-INF/web.xml, and getForwardPage returns ../WEB-INF/web.xml, the server-side forwarding mechanism might resolve this path relative to an unexpected directory (e.g., the web application root) and allow the attacker to access sensitive files like web.xml (which contains configuration details, potentially including credentials or sensitive paths).
+
+Similarly, an attacker could use ../../../../etc/passwd to attempt to read system files outside the web application's sandbox.
+
+Bypassing Intended Application Flow:
+
+The method's comment states it should return "Wiki.jsp", "PageInfo.jsp", etc., implying it's meant to direct to specific, known JSP pages. By allowing arbitrary paths, an attacker could potentially direct the application to internal resources or functionalities not intended for direct public access, or bypass authentication/authorization checks.
+
+Lack of Whitelisting or Canonicalization:
+
+The original code lacks any form of input validation to ensure that request.getPathInfo() refers only to expected, safe internal pages. There is no whitelisting of allowed page names, no blacklisting of dangerous characters or sequences (like ..), and no canonicalization of the path to resolve .. sequences before use.
+
+The patch directly addresses this by hardcoding the return value to "Wiki.jsp". This eliminates the reliance on user-controlled input for determining the forward page, thereby completely mitigating the path traversal vulnerability.

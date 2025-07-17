@@ -1,0 +1,36 @@
+Root Cause Analysis of CWE-835 in ZipArchiveInputStream
+The vulnerability (CWE-835: Loop with Unreachable Exit Condition) in the ZipArchiveInputStream class, as indicated by the provided code changes, is located within the readStored method. The root cause of this vulnerability is an incorrect handling of the end-of-stream (EOF) condition when reading data for a "STORED" entry, leading to an infinite loop.
+
+The Core Problem: Incomplete EOF Handling in readStored
+Before the patch, the readStored method contained a loop that intended to read data from the underlying input stream (in) into a buffer (buf) and then transfer it to the user-provided buffer. The flaw occurred when the underlying stream reached its end (in.read(buf.array()) returned -1) while the current.bytesRead was still less than current.entry.getSize().
+
+Specific Vulnerabilities Arising from the Loop's Logic:
+Misinterpretation of EOF:
+
+When in.read(buf.array()) returned -1 (indicating end-of-file), the original code would then return -1;. This was the intended exit for EOF.
+
+However, if the current.bytesRead >= csize condition (meaning all expected bytes for the current entry have been read) was not yet met when in.read returned -1, the code would not immediately return -1. Instead, it would proceed to the buf.limit(0); line.
+
+Creation of an Unreachable Exit Condition:
+
+Consider a scenario where current.entry.getSize() is a large value, but the underlying stream in unexpectedly reaches EOF before all csize bytes have been read for the current entry.
+
+In the original code, when in.read(buf.array()) returns -1:
+
+buf.limit(0) is called, setting the buffer's limit to 0.
+
+buf.position(0) is called implicitly by buf.limit(0) (or explicitly if buf.clear() was called before limit).
+
+In the next iteration of the while loop within readStored, buf.remaining() will always be 0.
+
+Consequently, toRead (calculated as Math.min(buf.remaining(), length)) will always be 0.
+
+buf.get(buffer, offset, toRead) will read 0 bytes.
+
+current.bytesRead will not increment because toRead is 0.
+
+The loop condition current.bytesRead >= csize will never become true, as current.bytesRead is stuck at a value less than csize.
+
+This creates an infinite loop where readStored continuously attempts to read 0 bytes, never advancing current.bytesRead to meet the exit condition, effectively causing a denial of service.
+
+The patch addresses this by changing the behavior when in.read(buf.array()) returns -1. Instead of just returning -1, it now explicitly throws an IOException("Truncated ZIP file"). This immediate exception prevents the infinite loop by halting execution when an unexpected end-of-file is encountered, ensuring that the application doesn't get stuck in an unrecoverable state while trying to read a truncated entry.

@@ -1,0 +1,31 @@
+Root Cause Analysis of CWE-20 in MediaTypeHeaderDelegate
+The vulnerability (CWE-20: Improper Input Validation) in the MediaTypeHeaderDelegate class, as indicated by the provided code changes, is located within the isValid method. The root cause of this vulnerability is the failure to explicitly disallow newline characters within the major and subtype components of a media type string.
+
+The Core Problem: Unsanitized Media Type Components
+Before the patch, the isValid method checked for a predefined set of "special" characters that are not allowed in unquoted media type tokens (like major and subtype). However, it did not include the newline character (\n) in this list of forbidden characters. This omission meant that a malicious or malformed media type string containing a newline character would be considered "valid" by this method.
+
+Specific Vulnerabilities Arising from Unsanitized Input:
+HTTP Header Injection (CRLF Injection):
+
+The most significant risk associated with allowing newline characters in header values is HTTP Header Injection, often a form of CRLF (Carriage Return Line Feed) injection. If the validated media type string (which could contain \n) was later used to construct an HTTP response header without further sanitization, an attacker could inject arbitrary new header lines.
+
+For example, if an attacker could control the type parameter passed to fromString and inject a string like application/json\nSet-Cookie: evilcookie=value, the server might send two separate headers:
+
+Content-Type: application/json
+Set-Cookie: evilcookie=value
+
+This could lead to various attacks, including:
+
+Session Fixation/Hijacking: Injecting malicious Set-Cookie headers.
+
+Cross-Site Scripting (XSS): If the injected header content is reflected in a browser in an unsanitized context.
+
+Cache Poisoning: Manipulating cache behavior by injecting headers.
+
+Response Splitting: Injecting an entirely new HTTP response, potentially leading to phishing or other client-side attacks.
+
+Improper Parsing and Application Behavior:
+
+Even if not directly leading to header injection, the presence of newline characters could cause unexpected parsing behavior in downstream systems or clients that consume the media type. This could lead to malformed headers, application errors, or inconsistencies in how content is handled.
+
+The patch directly addresses this by adding case '\\n': to the isValid method's switch statement. By explicitly returning false if a newline character is encountered, the MediaTypeHeaderDelegate now correctly rejects media type strings containing newlines, thereby preventing HTTP Header Injection and ensuring that only properly formatted media types are processed.
