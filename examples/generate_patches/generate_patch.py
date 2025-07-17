@@ -9,6 +9,16 @@ from typing import Dict, List, Any, Union
 import configparser
 from abc import ABC, abstractmethod
 
+# javalang 라이브러리 임포트 시도
+try:
+    import javalang
+except ImportError:
+    print("javalang is not installed. Please install it using: pip install javalang")
+    javalang = None
+
+# Elasticsearch 라이브러리 임포트 -> 제거
+import glob
+
 from graph_of_thoughts import controller, language_models, prompter, parser
 from graph_of_thoughts.operations import (
     Operation, OperationType, Thought, Generate, Aggregate, GraphOfOperations, Score, KeepBestN
@@ -161,7 +171,8 @@ class _ChatGPT(_AbstractLanguageModel):
         self.prompt_token_cost: float = float(self.config.get("prompt_token_cost", 0.03))
         self.response_token_cost: float = float(self.config.get("response_token_cost", 0.06))
         self.temperature: float = float(self.config.get("temperature", 1.0))
-        self.max_tokens: int = int(self.config.get("max_tokens", 4096))
+        # 컨텍스트 길이 초과 오류를 피하기 위해 max_tokens를 4096으로 강제합니다.
+        self.max_tokens: int = 4096
         self.stop: Union[str, List[str], None] = self.config.get("stop")
         self.organization: str = self.config.get("organization")
         self.api_key: str = self.config.get("api_key")
@@ -237,6 +248,47 @@ def load_rag_context(rag_file_path: str) -> Dict:
         logging.error(f"RAG 컨텍스트 로드 실패: {e}")
         return {}
 
+class LocalRAGSearcher:
+    """
+    로컬 JSON 파일에서 RAG 컨텍스트를 검색하는 클래스.
+    """
+    def __init__(self, rag_directory: str):
+        self.rag_data = []
+        rag_path = os.path.join(rag_directory, '*.json')
+        try:
+            for file_path in glob.glob(rag_path):
+                with open(file_path, 'r') as f:
+                    self.rag_data.append(json.load(f))
+            logging.info(f"Successfully loaded {len(self.rag_data)} RAG files from {rag_path}")
+        except Exception as e:
+            logging.error(f"Failed to load RAG files: {e}")
+
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Jaccard 유사도를 계산하는 간단한 함수."""
+        set1 = set(text1.lower().split())
+        set2 = set(text2.lower().split())
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        return intersection / union if union > 0 else 0
+
+    def search(self, query_purpose: str, top_k: int = 1) -> List[Dict]:
+        if not self.rag_data or not query_purpose:
+            return []
+        
+        scores = []
+        for doc in self.rag_data:
+            doc_purpose = doc.get("purpose", "")
+            if doc_purpose:
+                similarity = self._calculate_similarity(query_purpose, doc_purpose)
+                scores.append((similarity, doc))
+        
+        # 점수가 높은 순으로 정렬
+        scores.sort(key=lambda x: x[0], reverse=True)
+        
+        # 상위 k개의 문서 내용 반환
+        return [doc for score, doc in scores[:top_k]]
+
+
 class PatchPrompter(prompter.Prompter):
     """
     Prompter for generating, improving, and aggregating code patches.
@@ -259,6 +311,7 @@ please generate the code semantics of the following code.
 you should generate the code semantics in the following format:
 
 title: code title
+purpose: A concise, one-sentence description of what the code does.
 concept: code concept
 core_flaw: code core flaw
 analogy: code analogy
@@ -281,6 +334,7 @@ You must output the code semantics in the following format:
     json_example_for_semantics = {
         "vulnerable_code_abstraction": {
             "title": "Abstract Representation of Vulnerable Code: Unconditional Type Trustor",
+            "purpose": "This code deserializes a JSON array into a Java array of a specified type, attempting to handle generic types.",
             "concept": "This code assumes that type information passed from an external source is trustworthy and delegates to the internal parser logic based on this assumption. Despite the possibility that 'componentClass' and 'componentType' can differ, it uses them interchangeably in certain sections, performing instantiation without validation.",
             "core_flaw": "The core flaw is that critical information determining the system's behavior (the type) is introduced from external input but is used without any structural validation or reliability checks. Specifically, if the type information used in the type inference process and the parsing delegation process mismatches, malicious objects can be created through a vulnerable path.",
             "analogy": "This is like passing a blueprint received from an external source to the production line without review. Even though problems in the blueprint could lead to the creation of dangerous machinery or parts, a structure that passes it on based solely on its appearance is highly vulnerable from a security perspective.",
@@ -324,9 +378,8 @@ You must output the code semantics in the following format:
         )
 
     vulnerability_analysis_prompt_template = """<Instruction>
-You are an expert security analyst. Analyze the provided vulnerable code to identify the root cause of the vulnerability.
+You are an expert security analyst. Analyze the provided code and its semantics to identify the root cause of the vulnerability.
 Focus on the specific code patterns, logic flaws, or missing checks that lead to the security issue.
-{vulnerability_analysis_guidance}
 
 Your analysis should be concise and structured as a JSON object.
 
@@ -334,7 +387,6 @@ You must output the analysis in the following format:
 ```json
 {{
   "vulnerability_analysis": {{
-    "vulnerability_id": "CWE-XX",
     "title": "A brief, descriptive title of the vulnerability.",
     "root_cause_summary": "A detailed explanation of the core technical reason for the vulnerability. Explain *why* the code is insecure.",
     "attack_scenario": "Describe a potential attack scenario that could exploit this vulnerability.",
@@ -343,6 +395,9 @@ You must output the analysis in the following format:
 }}
 ```
 </Instruction>
+<Code Semantics Analysis>
+{code_semantics}
+</Code Semantics Analysis>
 <Vulnerable Code>
 ```java
 {vulnerable_code}
@@ -351,20 +406,19 @@ You must output the analysis in the following format:
 <Analysis>
 """
 
-    def generate_vulnerability_analysis_prompt(self, vulnerable_code: str) -> str:
+    def generate_vulnerability_analysis_prompt(self, vulnerable_code: str, code_semantics: Dict) -> str:
         """취약점 분석을 위한 프롬프트를 생성합니다."""
-        vulnerability_analysis_guidance = self._format_vulnerability_analysis_guidance()
+        semantics_str = json.dumps(code_semantics, indent=2)
         return self.vulnerability_analysis_prompt_template.format(
             vulnerable_code=vulnerable_code,
-            vulnerability_analysis_guidance=vulnerability_analysis_guidance # RAG 컨텍스트 추가
+            code_semantics=semantics_str
         )
-
 
     # 패치를 생성하는 프롬프트
     generate_patch_prompt = """<Instruction>
     You are an expert software engineer specializing in security.
-    Based on the provided root cause analysis and the vulnerable code, rewrite the entire code to fix the vulnerability.
-    {patch_design_guidance}
+    Based on the provided code semantics analysis and the vulnerable code, rewrite the entire code to fix the vulnerability.
+    If available, use the provided RAG (Retrieval-Augmented Generation) context which contains relevant security principles or similar solved cases.
 
     **VERY IMPORTANT RULES:**
     1.  You MUST output the COMPLETE, modified Java code for the file.
@@ -373,21 +427,33 @@ You must output the analysis in the following format:
 
     Output ONLY the code content within <PatchedCode> and </PatchedCode> tags.
     </Instruction>
-    <Root Cause Analysis>{root_cause}</Root Cause Analysis>
+    <Code Semantics Analysis>
+    {code_semantics}
+    </Code Semantics Analysis>
     <Vulnerable Code>
     ```java
     {vulnerable_code}
     ```
     </Vulnerable Code>
+    <RAG Context>
+    {rag_context}
+    </RAG Context>
     <PatchedCode>
     """
 
     def generate_prompt(self, num_branches: int, **kwargs) -> str:
-        if self.rag_context:
-            kwargs["patch_design_guidance"] = self._format_patch_design_steps()
-        else:
-            kwargs["patch_design_guidance"] = ""
-        return self.generate_patch_prompt.format(**kwargs)
+        # kwargs에서 필요한 모든 데이터를 가져옵니다.
+        # JSON 객체일 수 있으므로 문자열로 변환합니다.
+        semantics_str = json.dumps(kwargs.get("code_semantics", {}), indent=2)
+        vuln_analysis_str = json.dumps(kwargs.get("vulnerability_analysis", {}), indent=2)
+        rag_str = json.dumps(kwargs.get("rag_context", []), indent=2)
+
+        return self.generate_patch_prompt.format(
+            code_semantics=semantics_str,
+            vulnerability_analysis=vuln_analysis_str,
+            vulnerable_code=kwargs.get("vulnerable_code", ""),
+            rag_context=rag_str
+        )
 
     # 코드 패치를 개선하는데 활용,
     # Validate 단계 이후에 활용
@@ -428,14 +494,16 @@ Here are the criteria for evaluating the code:
 Refer to relevant patches, but you don't need to if you deem them unnecessary.
 
 Here are the criteria for evaluating the code:
-1.  **Vulnerability Fix (Weight: 30%)**: Does the new code correctly and completely fix the described vulnerability?
+1.  **Vulnerability Fix (Weight: 30%)**: Does the new code correctly and completely fix the described vulnerability based on the semantics?
 2.  **Correctness (Weight: 25%)**: Is the code syntactically correct and free of obvious bugs? Does it preserve the original functionality?
 3.  **Code Quality (Weight: 25%)**: Is the code clean, well-structured, and maintainable?
 4.  **Minimality of Change (Weight: 20%)**: Can the vulnerability be fixed with the minimal necessary code modifications, avoiding unnecessary changes?
 The final output must be the complete, final Java code.
 Output the final, synthesized code within <FinalCode> and </FinalCode> tags.
 </Instruction>
-<Root Cause Analysis>{root_cause}</Root Cause Analysis>
+<Code Semantics Analysis>
+{code_semantics}
+</Code Semantics Analysis>
 <Vulnerable Code>
 ```java
 {vulnerable_code}
@@ -465,7 +533,9 @@ Example:
     "rationale": "The patch effectively addresses the vulnerability by adding input validation, but the hard-coded safe class list could be more flexible.",
 }}
 
-<Root Cause Analysis>{root_cause}</Root Cause Analysis>
+<Code Semantics Analysis>
+{code_semantics}
+</Code Semantics Analysis>
 <Vulnerable Code>
 ```java
 {vulnerable_code}
@@ -484,7 +554,7 @@ Example:
 
     # --- aggregation_prompt 메서드 수정 시작 ---
     def aggregation_prompt(self, state_dicts: List[Dict], **kwargs) -> str:
-        state = state_dicts[0] # root_cause와 vulnerable_code는 후보들 간에 일관적이라고 가정
+        state = state_dicts[0] # code_semantics와 vulnerable_code는 후보들 간에 일관적이라고 가정
         patches_str = ""
         for i, d in enumerate(state_dicts):
             score = d.get('score', 'N/A')
@@ -494,7 +564,7 @@ Example:
             patches_str += f"```java\n{d['patched_code']}\n```\n\n"
         
         return self.aggregate_patches_prompt.format(
-            root_cause=state['root_cause'],
+            code_semantics=json.dumps(state.get('code_semantics', {}), indent=2),
             vulnerable_code=state['vulnerable_code'],
             patches=patches_str.strip()
         )
@@ -506,7 +576,7 @@ Example:
         # 이 구현에서는 한 번에 하나의 사고에 대해 점수를 매긴다고 가정
         state = state_dicts[0]
         return self._score_prompt_template.format(
-            root_cause=state['root_cause'],
+            code_semantics=json.dumps(state.get('code_semantics', {}), indent=2),
             vulnerable_code=state['vulnerable_code'],
             patched_code=state['patched_code']
         )
@@ -514,43 +584,37 @@ Example:
 
 class VulnerabilityAnalysisOperation(Operation):
     """
-    취약점 분석을 수행하는 작업
+    CodeSemantics를 기반으로 취약점 분석을 수행하는 작업.
     """
     def __init__(self):
         super().__init__()
-        self.operation_type = OperationType.generate  # 기존 타입 재사용
+        self.operation_type = OperationType.generate
         self.thoughts: List[Thought] = []
 
     def _execute(self, lm: _AbstractLanguageModel, prompter: Prompter, parser: Parser, **kwargs) -> None:
         input_thoughts = self.get_previous_thoughts()
-        if not input_thoughts:
-            # 초기 상태에서 시작하는 경우
-            vulnerable_code = kwargs.get("vulnerable_code")
-            if not vulnerable_code:
-                logging.error("No vulnerable_code provided for vulnerability analysis")
-                return
-            thought = Thought(state=kwargs)
-            thought.valid = True
-            input_thoughts = [thought]
-
         for thought in input_thoughts:
-            # 취약점 분석 프롬프트 생성
+            code = thought.state.get("vulnerable_code")
+            semantics = thought.state.get("code_semantics")
+            if not code or not semantics:
+                self.thoughts.append(thought)
+                continue
+
             prompt = prompter.generate_vulnerability_analysis_prompt(
-                vulnerable_code=thought.state.get("vulnerable_code", "")
+                vulnerable_code=code,
+                code_semantics=semantics
             )
             
-            # LLM에 분석 요청
             responses = lm.generate_text(prompt, num_branches=1)
             
             if responses:
-                # 응답 파싱 및 상태 업데이트
-                new_states = parser.parse_vulnerability_analysis_answer(thought.state, responses)
-                for new_state in new_states:
-                    new_thought = Thought(state=new_state)
-                    new_thought.valid = True
-                    self.thoughts.append(new_thought)
+                new_state = parser.parse_vulnerability_analysis_answer(thought.state, responses)
+                new_thought = Thought(state=new_state)
+                new_thought.valid = True
+                self.thoughts.append(new_thought)
             else:
                 logging.error("No response from LLM for vulnerability analysis")
+                self.thoughts.append(thought) # 실패해도 원래 thought 전달
 
     def get_thoughts(self) -> List[Thought]:
         return self.thoughts
@@ -623,21 +687,25 @@ class PatchParser(parser.Parser):
         scores = []
         for i, text in enumerate(texts):
             try:
-                # 응답에서 JSON 부분 추출
-                json_text = self.strip_answer_helper(text, "Evaluation")
-                if not json_text:
-                    if '```json' in text:
-                        json_text = text.split('```json')[1].split('```')[0]
-                    elif '```' in text:
-                        json_text = text.split('```')[1].split('```')[0]
+                # Gemini가 ```json ... ``` 와 같이 반환하는 경우가 있어서 파싱 로직 강화
+                json_text = text
+                if '```json' in json_text:
+                    json_text = json_text.split('```json')[1].split('```')[0]
+                elif '```' in json_text:
+                    json_text = json_text.split('```')[1].split('```')[0]
                 
-                if not json_text:
-                    # 원시 JSON 응답에 대한 대체
+                # 만약 그래도 파싱이 안되면, 가장 바깥쪽의 { } 를 기준으로 파싱 시도
+                try:
+                    parsed = json.loads(json_text)
+                except json.JSONDecodeError:
                     start = text.find('{')
                     end = text.rfind('}') + 1
-                    if start != -1 and end != -1:
+                    if start != -1 and end > start:
                         json_text = text[start:end]
-
+                        parsed = json.loads(json_text)
+                    else:
+                        raise
+                        
                 parsed = json.loads(json_text)
                 score = float(parsed.get("score", 0.0))
                 rationale = parsed.get("rationale", "")
@@ -657,38 +725,52 @@ class PatchParser(parser.Parser):
                 scores.append(0.0)
         return scores
 
-    def parse_vulnerability_analysis_answer(self, state: Dict, texts: List[str]) -> List[Dict]:
+    def parse_vulnerability_analysis_answer(self, state: Dict, texts: List[str]) -> Dict:
         """
         취약점 분석 결과를 파싱합니다.
         """
-        new_states = []
-        for text in texts:
-            try:
-                # <Analysis> 태그 내의 JSON 응답 추출
-                analysis_start = text.find("<Analysis>") + len("<Analysis>")
-                analysis_end = text.find("</Analysis>")
-                if analysis_end == -1:  # 닫는 태그가 없으면 문자열 끝까지
-                    analysis_end = len(text)
-                
-                json_str = text[analysis_start:analysis_end].strip()
-                analysis_result = json.loads(json_str)
-                
-                # 기존 상태 복사 및 분석 결과 추가
-                new_state = state.copy()
-                new_state["vulnerability_analysis"] = analysis_result
-                new_states.append(new_state)
-                
-            except (json.JSONDecodeError, ValueError) as e:
-                logging.error(f"Failed to parse vulnerability analysis result: {e}")
-                continue
-            
-        return new_states
+        try:
+            if not texts or not texts[0].strip():
+                logging.warning("Received empty response for vulnerability analysis.")
+                return state
 
+            text = texts[0]
+            json_str = self.strip_answer_helper(text, "Analysis")
+            if not json_str:
+                if '```json' in text:
+                    json_str = text.split('```json')[1].split('```')[0]
+                elif '```' in text:
+                    json_str = text.split('```')[1].split('```')[0]
+            
+            if not json_str.strip():
+                if text.strip().startswith('{'):
+                    json_str = text
+                else:
+                    logging.warning("Could not find JSON block in the response for vulnerability analysis.")
+                    return state
+            
+            if json_str.strip().startswith('json'):
+                json_str = json_str.strip()[4:].strip()
+
+            analysis_result = json.loads(json_str)
+            
+            new_state = state.copy()
+            new_state["vulnerability_analysis"] = analysis_result.get("vulnerability_analysis", {})
+            return new_state
+
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.error(f"Failed to parse vulnerability analysis result: {e}")
+            return state
+            
     def parse_code_semantics_answer(self, state: Dict, texts: List[str]) -> Dict:
         """
         코드 의미론 분석 결과를 파싱합니다.
         """
         try:
+            if not texts or not texts[0].strip():
+                logging.warning("Received empty response for code semantics analysis.")
+                return state
+                
             text = texts[0]
             # ```json ... ``` 블록 찾기
             json_str = self.strip_answer_helper(text, "Analysis")
@@ -698,12 +780,26 @@ class PatchParser(parser.Parser):
                 elif '```' in text: # Fallback for just ```
                     json_str = text.split('```')[1].split('```')[0]
             
-            if not json_str:
-                # 태그나 마크다운 없이 순수 JSON만 반환된 경우
-                json_str = text
-                
-            semantics_result = json.loads(json_str)
+            if not json_str.strip():
+                # 태그나 마크다운 없이 순수 JSON만 반환된 경우일 수 있음
+                # 하지만 비어있다면 파싱 시도하지 않음
+                if text.strip().startswith('{'):
+                    json_str = text
+                else:
+                    logging.warning("Could not find JSON block in the response for code semantics.")
+                    return state
             
+            # Gemini가 응답 시작 부분에 'json'이라는 단어를 추가하는 경우가 있음
+            if json_str.strip().startswith('json'):
+                json_str = json_str.strip()[4:].strip()
+
+            # JSON 파싱을 시도하고, 실패할 경우를 대비합니다.
+            try:
+                semantics_result = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse JSON for code semantics: {e}. Response was: {json_str}")
+                return state
+
             new_state = state.copy()
             new_state["code_semantics"] = semantics_result
             return new_state
@@ -814,6 +910,90 @@ class ValidateAndImproveOperation(Operation):
 
 # --- ValidateAndImproveOperation 클래스 수정 끝 ---
 
+def extract_java_methods(code: str) -> Dict[str, str]:
+    """
+    javalang 라이브러리를 사용하여 Java 코드에서 각 메서드의 이름과 소스 코드를 추출합니다.
+    """
+    if not javalang:
+        logging.error("javalang library is not available. Cannot extract methods.")
+        return {}
+        
+    methods = {}
+    try:
+        tree = javalang.parse.parse(code)
+        # CompilationUnit에서 직접 MethodDeclaration을 찾습니다.
+        for _, method_node in tree.filter(javalang.tree.MethodDeclaration):
+            # 메서드 시작과 끝 라인 찾기
+            start_line = method_node.position.line
+            
+            # 메서드 본문의 끝을 나타내는 닫는 중괄호 '}'를 찾습니다.
+            # 이를 위해 토큰 스트림을 순회해야 합니다.
+            # 이 방법은 javalang의 내부 구조에 의존하므로 주의가 필요합니다.
+            # 더 간단한 방법은 다음 메서드의 시작점을 찾는 것입니다.
+            # 여기서는 우선 간단하게 전체 메서드 블록을 가져오도록 시도합니다.
+            
+            # 메서드 코드 추출을 위해 전체 코드를 줄 단위로 분할
+            code_lines = code.splitlines()
+            
+            # 메서드 본문을 포함한 전체를 가져오기 위해 마지막 토큰의 라인을 찾음
+            # 이 방법이 불안정하다면, 다음 노드의 시작 라인을 찾는 방법으로 돌아가야 합니다.
+            try:
+                # 메서드 노드에 직접 접근할 수 있는 토큰이 있는지 확인
+                # javalang 0.13.0 에서는 MethodDeclaration 객체에 tokens 속성이 없습니다.
+                # 대신, 더 견고한 방법으로 메서드 범위를 추정해야 합니다.
+                
+                # 중괄호 균형을 맞춰 메서드 끝을 찾습니다.
+                body_start_token = None
+                for token in method_node.parameters: # 파라미터 뒤에서 시작
+                    pass # 마지막 파라미터 토큰 찾기
+                
+                # body를 직접 찾는 API가 없으므로, 수동으로 찾아야 합니다.
+                # 이는 매우 복잡하므로, 다른 접근법을 사용합니다.
+                
+                # 모든 노드를 가져와서 위치를 기반으로 범위를 결정합니다.
+                all_nodes = list(tree.filter(lambda n: hasattr(n, 'position') and n.position is not None))
+                all_nodes.sort(key=lambda n: n.position.line)
+                
+                current_node_index = -1
+                for i, n in enumerate(all_nodes):
+                    if n == method_node:
+                        current_node_index = i
+                        break
+                
+                end_line = len(code_lines)
+                if current_node_index != -1 and current_node_index + 1 < len(all_nodes):
+                    next_node = all_nodes[current_node_index + 1]
+                    # 다음 노드가 같은 줄이나 이전 줄에 있으면 안됨
+                    if next_node.position.line > start_line:
+                         end_line = next_node.position.line -1
+
+                # heuristic: 메서드 시그니처 후 첫 '{' 부터 마지막 '}' 까지
+                method_text_lines = code_lines[start_line - 1:]
+                open_braces = 0
+                method_end_line_in_slice = 0
+                body_found = False
+                for i, line in enumerate(method_text_lines):
+                    if '{' in line and not body_found:
+                        body_found = True
+                    if body_found:
+                        open_braces += line.count('{')
+                        open_braces -= line.count('}')
+                        if open_braces == 0:
+                            method_end_line_in_slice = i
+                            break
+                
+                end_line = start_line + method_end_line_in_slice
+                methods[method_node.name] = "\n".join(code_lines[start_line-1 : end_line])
+
+            except Exception as e_inner:
+                logging.warning(f"Could not determine end of method {method_node.name} precisely: {e_inner}")
+                # 실패 시, 단순히 시작 라인부터 20라인을 가져오는 등의 대체 로직
+                methods[method_node.name] = "\n".join(code.splitlines()[start_line-1 : start_line+19])
+                
+    except Exception as e:
+        logging.error(f"Failed to parse Java code and extract methods: {e}")
+    return methods
+
 class CodeSemanticsOperation(Operation):
     """
     코드의 의미론적 특성을 분석하는 작업
@@ -852,6 +1032,39 @@ class CodeSemanticsOperation(Operation):
                 self.thoughts.append(new_thought)
             else:
                 logging.error("No response from LLM for code semantics analysis")
+
+    def get_thoughts(self) -> List[Thought]:
+        return self.thoughts
+
+class RAGSearchOperation(Operation):
+    """
+    CodeSemantics를 기반으로 로컬 JSON 파일에서 RAG 컨텍스트를 검색하는 작업.
+    """
+    def __init__(self, rag_searcher: LocalRAGSearcher):
+        super().__init__()
+        self.operation_type = OperationType.generate
+        self.rag_searcher = rag_searcher
+        self.thoughts: List[Thought] = []
+
+    def _execute(self, lm: _AbstractLanguageModel, prompter: Prompter, parser: Parser, **kwargs) -> None:
+        input_thoughts = self.get_previous_thoughts()
+        for thought in input_thoughts:
+            semantics = thought.state.get("code_semantics", {})
+            vuln_analysis = thought.state.get("vulnerability_analysis", {})
+
+            if not vuln_analysis or not self.rag_searcher:
+                self.thoughts.append(thought)
+                continue
+            
+            # 검색 쿼리 생성 (취약점 분석 요약 사용)
+            query_text = vuln_analysis.get('root_cause_summary', '')
+            
+            if query_text:
+                rag_results = self.rag_searcher.search(query_purpose=query_text) # query_purpose 파라미터 이름 유지
+                thought.state['rag_context'] = rag_results
+                logging.info(f"Found {len(rag_results)} RAG documents for thought {thought.id}")
+            
+            self.thoughts.append(thought)
 
     def get_thoughts(self) -> List[Thought]:
         return self.thoughts
@@ -936,12 +1149,9 @@ def run(args):
     model_name_sanitized = args.model.replace(":", "_")
     args.output_dir = os.path.join(args.output_dir, model_name_sanitized)
 
-    script_dir = os.path.dirname(__file__)
     try:
-        with open(os.path.join(script_dir, args.vulnerable_file), "r") as f:
-            vulnerable_code = f.read()
-        with open(os.path.join(script_dir, args.root_cause_file), "r") as f:
-            root_cause = f.read()
+        with open(args.vulnerable_file, "r") as f:
+            java_code = f.read()
     except FileNotFoundError as e:
         logging.error(f"Input file not found: {e}")
         return
@@ -949,11 +1159,12 @@ def run(args):
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     
+    # --- 로컬 RAG 검색기 초기화 ---
+    script_dir = os.path.dirname(__file__)
+    rag_dir = os.path.join(script_dir, "..", "..", "RAG")
+    rag_searcher = LocalRAGSearcher(rag_directory=rag_dir)
+            
     # 언어 모델 설정
-    lm_config_path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "graph_of_thoughts", "language_models", "config.json"
-    )
-
     # --model 인수에 따라 언어 모델 동적 로드
     try:
         if args.model.startswith('chatgpt'):
@@ -982,92 +1193,64 @@ def run(args):
         logging.error(f"Failed to initialize language model: {e}")
         return
 
-    # RAG 컨텍스트 로드
-    rag_context = None
-    if args.use_rag:
-        rag_file = os.path.join(script_dir, "..", "..", "RAG", "1.json")
-        try:
-            with open(rag_file, "r") as f:
-                rag_context = json.load(f)
-            logging.info("Successfully loaded RAG context")
-        except Exception as e:
-            logging.warning(f"Failed to load RAG context: {e}. Proceeding without RAG.")
-
-    patch_prompter = PatchPrompter(rag_context)
+    patch_prompter = PatchPrompter()
     patch_parser = PatchParser()
-    
-    initial_state = {
-        "vulnerable_code": vulnerable_code,
-        "root_cause": root_cause,
-    }
-    
-    # --- Backtracking 구현: 최종 점수 기반 재시도 ---
-    max_overall_attempts = 3 # 전체 GoT 프로세스를 재시도할 최대 횟수
-    min_acceptable_score = 7.0 # 최종 패치의 최소 허용 점수
 
-    for overall_attempt in range(max_overall_attempts):
-        print(f"\n--- Starting overall attempt {overall_attempt + 1}/{max_overall_attempts} ---")
+    # Java 파일에서 모든 함수 추출
+    methods = extract_java_methods(java_code)
+    if not methods:
+        logging.error("No methods found in the provided Java file.")
+        return
+
+    print(f"Found {len(methods)} methods to analyze: {list(methods.keys())}")
+
+    # --- 새로운 실행 로직: 의미 분석 -> RAG 검색 -> 패치 생성 ---
+    # 여기서는 첫 번째 함수에 대해서만 패치를 생성하도록 단순화합니다.
+    target_method_name, target_method_code = list(methods.items())[0]
+    
+    print(f"\n--- Generating patch for the first method: {target_method_name} ---")
+
+    initial_state = {"vulnerable_code": target_method_code}
+    
+    # 새로운 그래프 정의
+    graph = GraphOfOperations()
+    op1_semantics = CodeSemanticsOperation()
+    op2_vuln_analysis = VulnerabilityAnalysisOperation()
+    op3_rag_search = RAGSearchOperation(rag_searcher=rag_searcher)
+    op4_generate = Generate(num_branches_prompt=1) # 1개의 패치만 생성
+
+    graph.add_operation(op1_semantics)
+    graph.add_operation(op2_vuln_analysis)
+    graph.add_operation(op3_rag_search)
+    graph.add_operation(op4_generate)
+
+    op1_semantics.add_successor(op2_vuln_analysis)
+    op2_vuln_analysis.add_successor(op3_rag_search)
+    op3_rag_search.add_successor(op4_generate)
+
+    ctrl = controller.Controller(lm, graph, patch_prompter, patch_parser, problem_parameters=initial_state)
+    ctrl.run()
+
+    # 결과 출력
+    results = op4_generate.get_thoughts()
+    if results:
+        best_thought = results[0]
+        patched_code = best_thought.state.get('patched_code', 'Patch not generated.')
         
-        # 각 재시도마다 새로운 GraphOfOperations 인스턴스를 생성하여 그래프 상태를 초기화
-        # (이전 시도의 영향을 받지 않도록)
-        graph = advanced_patch_graph_with_aggregation(patch_prompter, patch_parser, args.vulnerable_file)
-        ctrl = controller.Controller(lm, graph, patch_prompter, patch_parser, problem_parameters=initial_state)
+        print("\n" + "="*50)
+        print(f"Generated Patch for: {target_method_name}")
+        print("="*50)
+        print(patched_code)
 
-        print("Starting Patch Generation with Aggregation and Scoring...")
-        start_time = datetime.datetime.now()
-        ctrl.run()
-        end_time = datetime.datetime.now()
-        print(f"Patch generation finished in {end_time - start_time}.")
-
-        # 최종 스코어링 작업에서 최적의 결과 가져오기
-        # op7_score_final은 그래프의 8번째 작업(인덱스 7)
-        final_results = graph.operations[7].get_thoughts()
-        
-        current_final_score = 0.0
-        if final_results:
-            best_thought = final_results[0] # 집계된 사고는 하나만 있어야 함
-            final_code = best_thought.state.get('final_code') or best_thought.state.get('patched_code')
-            if not final_code:
-                final_code = 'Final code not found.'
-
-            current_final_score = best_thought.state.get('score', 0.0)
-            rationale = best_thought.state.get('rationale', 'N/A')
-
-            print("\n" + "="*50)
-            print(f"Overall Attempt {overall_attempt + 1} - Final Aggregated Code (Score: {current_final_score})")
-            print("="*50)
-            print(f"Rationale: {rationale}")
-            print("-" * 50)
-            print(final_code)
-
-            # 백트래킹 조건 확인
-            if current_final_score >= min_acceptable_score:
-                print(f"\nFinal score {current_final_score} meets acceptable threshold ({min_acceptable_score}). Stopping.")
-                # 최종 성공 패치 저장
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                file_path = os.path.join(args.output_dir, f"generated_aggregated_patch_SUCCESS_{timestamp}.java")
-                with open(file_path, "w") as f:
-                    f.write(f"// Score: {current_final_score}\n// Rationale: {rationale}\n\n{final_code}")
-                print(f"\nFinal successful code saved to {file_path}")
-                return # 만족스러운 패치를 찾았으므로 run 함수 종료
-            else:
-                print(f"\nFinal score {current_final_score} is below acceptable threshold ({min_acceptable_score}). Retrying...")
-                # 필요하다면 다음 시도를 위해 initial_state 또는 그래프 파라미터 수정
-                # 예: op2_generate.num_branches_prompt = 10 # 다음 시도를 위해 브랜치 수 증가
-        else:
-            print(f"\nNo code was generated or survived the aggregation/scoring process in overall attempt {overall_attempt + 1}.")
-            print("Retrying...")
-    
-    # 생성된 최종 코드가 있어도 점수가 낮아 여기까지 왔다면 저장
-    if 'final_code' in locals() and final_code and final_code != 'Final code not found.':
+        # 패치 파일 저장
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = os.path.join(args.output_dir, f"generated_aggregated_patch_LOW_SCORE_{timestamp}.java")
+        file_path = os.path.join(args.output_dir, f"generated_patch_{target_method_name}_{timestamp}.java")
         with open(file_path, "w") as f:
-            f.write(f"// Score: {current_final_score}\n// Rationale: {rationale}\n\n{final_code}")
-        print(f"\nSaved final code with low score to {file_path}")
+            f.write(patched_code)
+        print(f"\nGenerated patch saved to {file_path}")
+    else:
+        print(f"Could not generate patch for method: {target_method_name}")
 
-    print(f"\n--- All {max_overall_attempts} overall attempts completed. No satisfactory patch found. ---")
-    # --- Backtracking 구현 끝 ---
 
 def main():
     """
@@ -1081,12 +1264,6 @@ def main():
         help="The language model to use for generation and scoring (e.g., 'chatgpt', 'gemini', 'ollama:qwen2').",
     )
     parser.add_argument("--config", type=str, default="config.ini", help="Path to the configuration file.")
-    parser.add_argument(
-        "--root_cause_file",
-        type=str,
-        default="root_cause.txt",
-        help="Path to the root cause analysis file.",
-    )
     parser.add_argument(
         "--vulnerable_file",
         type=str,

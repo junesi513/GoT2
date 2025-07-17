@@ -1,0 +1,634 @@
+2025-07-18 01:21:06,230 - --- REQUEST ---
+<Instruction>
+You are an expert software engineer specializing in security.
+please generate the code semantics of the following code.
+you should generate the code semantics in the following format:
+
+title: code title
+purpose: A concise, one-sentence description of what the code does.
+concept: code concept
+core_flaw: code core flaw
+analogy: code analogy
+quote: code quote
+
+You must output the code semantics in the following format:
+```json
+{
+    "vulnerable_code_abstraction": {
+        "title": "Abstract Representation of Vulnerable Code: Unconditional Type Trustor",
+        "purpose": "This code deserializes a JSON array into a Java array of a specified type, attempting to handle generic types.",
+        "concept": "This code assumes that type information passed from an external source is trustworthy and delegates to the internal parser logic based on this assumption. Despite the possibility that 'componentClass' and 'componentType' can differ, it uses them interchangeably in certain sections, performing instantiation without validation.",
+        "core_flaw": "The core flaw is that critical information determining the system's behavior (the type) is introduced from external input but is used without any structural validation or reliability checks. Specifically, if the type information used in the type inference process and the parsing delegation process mismatches, malicious objects can be created through a vulnerable path.",
+        "analogy": "This is like passing a blueprint received from an external source to the production line without review. Even though problems in the blueprint could lead to the creation of dangerous machinery or parts, a structure that passes it on based solely on its appearance is highly vulnerable from a security perspective.",
+        "quote": "Under the assumption that 'all input can be potentially hostile,' the reliability of input data must be verified before it is used for system control decisions. (Source: Secure Coding Principles)"
+    }
+}
+```
+</Instruction>
+
+<Code>
+```java
+    public final void write(JSONSerializer serializer, Object object, Object fieldName, Type fieldType, int features)
+                                                                                                       throws IOException {
+        SerializeWriter out = serializer.out;
+
+        Object[] array = (Object[]) object;
+
+        if (object == null) {
+            out.writeNull(SerializerFeature.WriteNullListAsEmpty);
+            return;
+        }
+
+        int size = array.length;
+
+        int end = size - 1;
+
+        if (end == -1) {
+            out.append("[]");
+            return;
+        }
+
+        SerialContext context = serializer.context;
+        serializer.setContext(context, object, fieldName, 0);
+
+        try {
+            Class<?> preClazz = null;
+            ObjectSerializer preWriter = null;
+            out.append('[');
+
+            if (out.isEnabled(SerializerFeature.PrettyFormat)) {
+                serializer.incrementIndent();
+                serializer.println();
+                for (int i = 0; i < size; ++i) {
+                    if (i != 0) {
+                        out.write(',');
+                        serializer.println();
+                    }
+                    serializer.write(array[i]);
+                }
+                serializer.decrementIdent();
+                serializer.println();
+                out.write(']');
+                return;
+            }
+
+            for (int i = 0; i < end; ++i) {
+                Object item = array[i];
+
+                if (item == null) {
+                    out.append("null,");
+                } else {
+                    if (serializer.containsReference(item)) {
+                        serializer.writeReference(item);
+                    } else {
+                        Class<?> clazz = item.getClass();
+
+                        if (clazz == preClazz) {
+                            preWriter.write(serializer, item, null, null, 0);
+                        } else {
+                            preClazz = clazz;
+                            preWriter = serializer.getObjectWriter(clazz);
+
+                            preWriter.write(serializer, item, null, null, 0);
+                        }
+                    }
+                    out.append(',');
+                }
+            }
+
+            Object item = array[end];
+
+            if (item == null) {
+                out.append("null]");
+            } else {
+                if (serializer.containsReference(item)) {
+                    serializer.writeReference(item);
+                } else {
+                    serializer.writeWithFieldName(item, end);
+                }
+                out.append(']');
+            }
+        } finally {
+            serializer.context = context;
+        }
+    }
+```
+</Code>
+<Analysis>
+
+
+2025-07-18 01:21:48,237 - --- RESPONSE ---
+<think>
+Okay, I need to analyze the given Java code and generate the code semantics in the specified JSON format. Let me start by reading through the code carefully.
+
+The method is called write and it takes several parameters including JSONSerializer, Object, fieldName, fieldType, and features. It seems to be part of a JSON serialization process for an array. The code casts the input object to an Object array. It handles the case when the array is null by writing a null value and returns. If the array is empty, it writes "[]". 
+
+The code then sets up a context for the serializer and loops through each element in the array. For each element, it checks if it's null, handles references, and determines the class of the item. It uses a preClazz and preWriter to optimize by reusing the same serializer if the class hasn't changed. For the last element, it appends without a comma.
+
+Now, looking for vulnerabilities. The key part is where it gets the class of each item using item.getClass(). Since this is user input or dynamically determined, if the item's class is not properly controlled, it might allow deserialization of arbitrary classes, leading to remote code execution. However, in this code, the focus is on serialization, not deserialization. Wait, the original problem might be about deserialization, but the code here is for writing/serializing. Hmm, maybe I'm misunderstanding. 
+
+Wait, maybe the user provided code that's part of a serialization process, but the core flaw could still be in trusting the input types. The core_flaw example given in the instruction was about deserialization of untrusted data leading to arbitrary object creation. In this code, even though it's serialization, the problem could be in handling the item.getClass() without validation. If an attacker can manipulate the 'item' objects being serialized to be of a malicious class, even during serialization, but I'm not sure how that's a vulnerability in serialization. 
+
+Wait, the instruction's example was about a core flaw where the type is taken from external input without validation, leading to object creation. Maybe in this code, if the 'item' is a malicious object, then using its class to get a serializer could lead to unsafe operations. For example, if the item is a Proxy or a maliciously crafted object, the getObjectWriter might not handle it correctly, leading to unexpected behavior. 
+
+The core flaw here is that the code uses the item.getClass() without validating it, which could allow an attacker to control the class used for serialization, possibly leading to unexpected data handling or execution. Even though it's a serializer, if the class is not trusted, the serializer might perform actions based on that class, which could be dangerous. 
+
+So, the title would be something like "Unvalidated Class Usage in Array Serialization". The purpose is to serialize an array of objects into JSON. The concept is that the code uses the class of each item dynamically, assuming they are safe. The core flaw is trusting the class of the item without validation, leading to potential security issues if an attacker can provide a malicious item whose class is processed. 
+
+The analogy would be like using parts from an untrusted supplier without inspecting them, leading to potential defects. The quote would emphasize validating input data. 
+
+I need to structure this into the JSON format as per the example. Let me check the example again. The vulnerable code was about deserialization of untrusted JSON into a Java array, leading to possible arbitrary object creation. In this case, the code is serializing, but the flaw is similar in that it's trusting the class of the object being serialized without checking. However, the example's core flaw was about deserialization, but this code is for serialization. Is there a mistake here?
+
+Wait, maybe the user provided the wrong code. But I need to analyze the given code. The original example in the instruction was about deserialization, but this code is serialization. The flaw here would be trusting the item's class. But in serialization, the primary concern is correctness, not security. Unless the serialization process itself is doing something dangerous based on the class. 
+
+Another angle: the code uses item.getClass() and then gets an ObjectWriter for that class. If the ObjectWriter is not properly secured, perhaps an attacker could inject a class that, when used by the writer, causes unintended behavior. For example, if the ObjectWriter for a certain class executes code during serialization, then allowing arbitrary classes to be serialized could lead to code execution. 
+
+In that case, the core flaw is similar to the deserialization case: the system is using external data to determine which classes to handle during serialization, without validating them. So the code is vulnerable if the serialization process can be tricked into using malicious classes, leading to potential exploits. 
+
+Therefore, the core_flaw is the lack of validation on the item's class during serialization. The title would be "Array Serialization with Untrusted Class Trust" or similar. The purpose is to serialize an array of objects. The concept is assuming that each item's class is safe. The analogy is trusting parts from an untrusted source. 
+
+I need to make sure the elements fit the required format. Let's structure it into the JSON with the given fields.
+</think>
+
+```json
+{
+    "vulnerable_code_abstraction": {
+        "title": "Array Serialization with Untrusted Class Trust",
+        "purpose": "This code serializes an array of objects into JSON format, dynamically selecting serializers based on the runtime class of each element.",
+        "concept": "The code processes each item in an array by dynamically determining its class at runtime using `item.getClass()` and delegates serialization to the corresponding `ObjectSerializer`. While this allows flexibility for heterogeneous arrays, it assumes that the class of each item is non-malicious and safe to serialize.",
+        "core_flaw": "The core flaw is the lack of validation on the runtime class of each array element. If an attacker can inject an object with a malicious class, the dynamic selection of `ObjectSerializer` may trigger unsafe behavior during serialization (e.g., executing malicious logic associated with the class or serializer), leading to potential security breaches.",
+        "analogy": "This is like accepting a tool from a stranger and assuming it is harmless. If the tool is designed to cause harm, using it without verification can compromise the system's safety.",
+        "quote": "Never trust user input, especially when it directly influences dynamic behavior such as class loading or code execution. Always validate and sanitize inputs rigorously." 
+    }
+}
+```
+
+2025-07-18 01:21:48,238 - --- REQUEST ---
+<Instruction>
+    You are an expert software engineer specializing in security.
+    Based on the provided code semantics analysis and the vulnerable code, rewrite the entire code to fix the vulnerability.
+    If available, use the provided RAG (Retrieval-Augmented Generation) context which contains relevant security principles or similar solved cases.
+
+    **VERY IMPORTANT RULES:**
+    1.  You MUST output the COMPLETE, modified Java code for the file.
+    2.  The code must be syntactically correct and compilable.
+    3.  Do NOT output a `diff` or a patch. Output the entire file content.
+
+    Output ONLY the code content within <PatchedCode> and </PatchedCode> tags.
+    </Instruction>
+    <Code Semantics Analysis>
+    {
+  "vulnerable_code_abstraction": {
+    "title": "Array Serialization with Untrusted Class Trust",
+    "purpose": "This code serializes an array of objects into JSON format, dynamically selecting serializers based on the runtime class of each element.",
+    "concept": "The code processes each item in an array by dynamically determining its class at runtime using `item.getClass()` and delegates serialization to the corresponding `ObjectSerializer`. While this allows flexibility for heterogeneous arrays, it assumes that the class of each item is non-malicious and safe to serialize.",
+    "core_flaw": "The core flaw is the lack of validation on the runtime class of each array element. If an attacker can inject an object with a malicious class, the dynamic selection of `ObjectSerializer` may trigger unsafe behavior during serialization (e.g., executing malicious logic associated with the class or serializer), leading to potential security breaches.",
+    "analogy": "This is like accepting a tool from a stranger and assuming it is harmless. If the tool is designed to cause harm, using it without verification can compromise the system's safety.",
+    "quote": "Never trust user input, especially when it directly influences dynamic behavior such as class loading or code execution. Always validate and sanitize inputs rigorously."
+  }
+}
+    </Code Semantics Analysis>
+    <Vulnerable Code>
+    ```java
+        public final void write(JSONSerializer serializer, Object object, Object fieldName, Type fieldType, int features)
+                                                                                                       throws IOException {
+        SerializeWriter out = serializer.out;
+
+        Object[] array = (Object[]) object;
+
+        if (object == null) {
+            out.writeNull(SerializerFeature.WriteNullListAsEmpty);
+            return;
+        }
+
+        int size = array.length;
+
+        int end = size - 1;
+
+        if (end == -1) {
+            out.append("[]");
+            return;
+        }
+
+        SerialContext context = serializer.context;
+        serializer.setContext(context, object, fieldName, 0);
+
+        try {
+            Class<?> preClazz = null;
+            ObjectSerializer preWriter = null;
+            out.append('[');
+
+            if (out.isEnabled(SerializerFeature.PrettyFormat)) {
+                serializer.incrementIndent();
+                serializer.println();
+                for (int i = 0; i < size; ++i) {
+                    if (i != 0) {
+                        out.write(',');
+                        serializer.println();
+                    }
+                    serializer.write(array[i]);
+                }
+                serializer.decrementIdent();
+                serializer.println();
+                out.write(']');
+                return;
+            }
+
+            for (int i = 0; i < end; ++i) {
+                Object item = array[i];
+
+                if (item == null) {
+                    out.append("null,");
+                } else {
+                    if (serializer.containsReference(item)) {
+                        serializer.writeReference(item);
+                    } else {
+                        Class<?> clazz = item.getClass();
+
+                        if (clazz == preClazz) {
+                            preWriter.write(serializer, item, null, null, 0);
+                        } else {
+                            preClazz = clazz;
+                            preWriter = serializer.getObjectWriter(clazz);
+
+                            preWriter.write(serializer, item, null, null, 0);
+                        }
+                    }
+                    out.append(',');
+                }
+            }
+
+            Object item = array[end];
+
+            if (item == null) {
+                out.append("null]");
+            } else {
+                if (serializer.containsReference(item)) {
+                    serializer.writeReference(item);
+                } else {
+                    serializer.writeWithFieldName(item, end);
+                }
+                out.append(']');
+            }
+        } finally {
+            serializer.context = context;
+        }
+    }
+    ```
+    </Vulnerable Code>
+    <RAG Context>
+    []
+    </RAG Context>
+    <PatchedCode>
+    
+
+2025-07-18 01:23:06,866 - --- RESPONSE ---
+<think>
+Okay, let's see. The user provided a Java code snippet that's vulnerable because it uses dynamic class loading without validation. The problem is that when serializing an array, each element's class is determined at runtime using item.getClass(), and then a corresponding serializer is fetched. The issue here is that if an attacker can inject a malicious object into the array, the code might load a harmful class, leading to security issues.
+
+So, the main task is to fix this by validating the class of each item before proceeding with serialization. How can I do that?
+
+First, I need to add a check to ensure that the class of the item is trusted. But how to define "trusted"? Since the RAG context doesn't provide specific examples, I'll assume that only certain classes (like standard Java classes or those in a whitelist) are allowed. Alternatively, maybe the code should reject any class that's not explicitly known.
+
+Looking at the code, where the class is retrieved with item.getClass(), that's where the check needs to happen. So, in the loop where each item is processed, after getting the clazz variable, add a validation step. For example, check if the class is in a predefined list of allowed classes, or check if it's a primitive type, common Java types, etc.
+
+Wait, but the user hasn't specified a whitelist. In security practices, it's better to have a whitelist approach. So the code should validate that the class is one of the expected ones. However, since the original code is supposed to handle heterogeneous arrays, maybe the allowed classes are determined at the time of setup, or maybe there's a way to dynamically check if the class is safe.
+
+Another approach: perhaps using a custom method to validate the class. For instance, checking if the class's package is trusted (like java.lang.*, etc.), or if it's a non-user-defined class. But that's not foolproof. Alternatively, the system could have a mechanism to register allowed classes.
+
+In the absence of existing configuration, the best I can do is to add a validation check that throws an exception if the class is not trusted. Let me think about how to implement that.
+
+In the code, after getting clazz = item.getClass(), insert a check. For example:
+
+if (!isClassAllowed(clazz)) {
+    throw new SecurityException("Untrusted class detected: " + clazz.getName());
+}
+
+But I need to implement isClassAllowed. How?
+
+Since this is Java, maybe check if the class is in a certain package. For example, if the application only allows classes from its own package or specific trusted packages. However, the code here is part of a JSON serializer, so maybe the allowed classes are determined by the serializer's configuration.
+
+But given that the RAG context is empty, I need to make an assumption. Let's assume that the code should only allow classes that are known to the system, perhaps by checking if the class loader is the same as the one that loaded a trusted class (like ObjectSerializer), or checking if the class is in a predefined whitelist.
+
+But since the code is part of a JSON serialization library, perhaps the allowed classes are managed through the serializer's configuration. However, in this case, the user might not have access to that. So, I'll need to add a method to validate classes.
+
+So, perhaps adding a helper method that checks if the class is in a list of allowed classes. For example, here's a possible approach:
+
+Add a method:
+
+private boolean isClassAllowed(Class<?> clazz) {
+    // Check against a whitelist of allowed classes
+    // This is a placeholder; actual implementation would depend on application needs
+    return clazz.isPrimitive() || 
+           clazz.isArray() ||
+           clazz.getName().startsWith("java.") ||
+           clazz.getName().startsWith("javax.") ||
+           clazz.getName().startsWith("com.example.trusted");
+}
+
+But this is just an example. The exact criteria depend on the application's trust model. Since the user hasn't provided specific criteria, I'll have to make a general solution.
+
+In the code, replace the part where the class is retrieved and then the serializer is fetched with a check. So, modify the code like:
+
+Class<?> clazz = item.getClass();
+if (!isClassAllowed(clazz)) {
+    throw new SecurityException("Untrusted class: " + clazz.getName());
+}
+// proceed with getting the serializer
+
+Now, implement the isClassAllowed method. But where to put it? Since this is part of a class, I'll add the method to the same class.
+
+But the code provided is part of a method, so I need to make sure the helper method is accessible. For the purpose of this exercise, I'll assume that adding this method is acceptable.
+
+So, integrating this into the existing code. Let me look at the vulnerable code again.
+
+In the loop, when processing each item:
+
+if (item != null) {
+    Class<?> clazz = item.getClass();
+    // validate clazz here
+    if (clazz == preClazz) {
+        ...
+    } else {
+        ...
+    }
+}
+
+So inserting the validation check here.
+
+But how to implement the validation. The example helper method would need to be added. However, the user's code may not have such a method. Therefore, in the patched code, I need to add this helper method.
+
+But since this is Java, I need to create a method that does this check. However, for a secure solution, perhaps the validation is done by checking if the class is in a predefined set, or using a whitelisting approach.
+
+So, putting it all together, in the patched code:
+
+Add a helper method isClassAllowed, and in the processing of each item, check it. If invalid, throw an exception.
+
+This way, any untrusted class would be blocked, preventing malicious code execution.
+
+Another consideration: if the application is expecting to handle user-defined classes, then perhaps a different approach is needed, like allowing only classes that have been registered with the serializer. But without specific info, the whitelist approach is the safest.
+
+Now, I need to modify the code. Let's see.
+
+In the existing code:
+
+if (item == null) {
+    out.append("null,");
+} else {
+    if (serializer.containsReference(item)) {
+        serializer.writeReference(item);
+    } else {
+        Class<?> clazz = item.getClass();
+
+        if (clazz == preClazz) {
+            preWriter.write(serializer, item, null, null, 0);
+        } else {
+            preClazz = clazz;
+            preWriter = serializer.getObjectWriter(clazz);
+
+            preWriter.write(serializer, item, null, null, 0);
+        }
+    }
+    out.append(',');
+}
+
+So, right after getting clazz, insert the check.
+
+So modify the code to:
+
+else {
+    if (serializer.containsReference(item)) {
+        serializer.writeReference(item);
+    } else {
+        Class<?> clazz = item.getClass();
+        if (!isClassAllowed(clazz)) {
+            throw new SecurityException("Untrusted class: " + clazz.getName());
+        }
+
+        if (clazz == preClazz) {
+            preWriter.write(serializer, item, null, null, 0);
+        } else {
+            preClazz = clazz;
+            preWriter = serializer.getObjectWriter(clazz);
+
+            preWriter.write(serializer, item, null, null, 0);
+        }
+    }
+    out.append(',');
+}
+
+Then add the isClassAllowed method. Since this is part of a class, perhaps the method is added to the same class. Let me think about the code structure.
+
+Assuming this code is part of a class (maybe a custom serializer), adding the helper method there.
+
+But for the purpose of the patched code, the helper function needs to be included.
+
+So, in the final code, the helper method is added.
+
+Now, the code may look like this.
+
+But the user's code is part of a method, so where is the helper method placed? In the class that contains the write method.
+
+In the provided code, the method is part of a class, so I can add a private method inside that class.
+
+So, here's the plan:
+
+- Add a private method isClassAllowed(Class<?> clazz) that checks if the class is allowed.
+
+For example:
+
+private boolean isClassAllowed(Class<?> clazz) {
+    // Example allowed packages/classes; adjust according to application's needs
+    String className = clazz.getName();
+    return className.startsWith("java.") || 
+           className.startsWith("javax.") || 
+           className.startsWith("com.example.trusted") || 
+           clazz.isPrimitive() || 
+           clazz.isArray();
+}
+
+This is a basic example. The actual allowed packages would depend on the application's trust model, but this is a placeholder for the fix.
+
+Now, integrate this into the code.
+
+So the patched code would include this helper method and the validation check.
+
+Therefore, the final code would have the modified loop with the validation check and the helper method.
+
+Another thing to consider: when item is not null and not a reference, we check its class. If the check fails, it throws an exception, preventing further processing.
+
+This addresses the vulnerability by ensuring that only classes deemed safe are processed.
+
+Now, let me write the full patched code.
+
+I'll take the original code and insert the check, and add the helper method.
+
+Also, make sure that the code is syntactically correct. So, in Java, the helper method must be defined within the class.
+
+Assuming that this code is part of a class, perhaps an inner class or a class that extends a certain serializer, the helper method is added.
+
+So, in the final code, the modified write method includes the check, and the new isClassAllowed method is present.
+
+So, the patched code would look something like this:
+
+public final void write(JSONSerializer serializer, Object object, Object fieldName, Type fieldType, int features) throws IOException {
+    // ... existing code ...
+
+    for (int i = 0; i < end; ++i) {
+        Object item = array[i];
+
+        if (item == null) {
+            out.append("null,");
+        } else {
+            if (serializer.containsReference(item)) {
+                serializer.writeReference(item);
+            } else {
+                Class<?> clazz = item.getClass();
+
+                if (!isClassAllowed(clazz)) {
+                    throw new SecurityException("Untrusted class detected: " + clazz.getName());
+                }
+
+                if (clazz == preClazz) {
+                    preWriter.write(serializer, item, null, null, 0);
+                } else {
+                    preClazz = clazz;
+                    preWriter = serializer.getObjectWriter(clazz);
+
+                    preWriter.write(serializer, item, null, null, 0);
+                }
+            }
+            out.append(',');
+        }
+    }
+
+    // ... rest of the code ...
+}
+
+private boolean isClassAllowed(Class<?> clazz) {
+    // Allow core Java classes, primitives, arrays, etc.
+    String className = clazz.getName();
+    return className.startsWith("java.") || 
+           className.startsWith("javax.") || 
+           className.startsWith("com.example.trusted") || 
+           clazz.isPrimitive() || 
+           clazz.isArray();
+}
+
+But wait, where to place the helper method? Since the original code is part of a class, adding it as a private method makes sense.
+
+Now, check for syntax correctness.
+
+Yes, the method is added, and the code is modified to call it.
+
+This should prevent untrusted classes from being processed.
+
+So the final answer includes this modification.
+</think>
+
+<PatchedCode>
+```java
+public final void write(JSONSerializer serializer, Object object, Object fieldName, Type fieldType, int features)
+        throws IOException {
+    SerializeWriter out = serializer.out;
+
+    Object[] array = (Object[]) object;
+
+    if (object == null) {
+        out.writeNull(SerializerFeature.WriteNullListAsEmpty);
+        return;
+    }
+
+    int size = array.length;
+
+    int end = size - 1;
+
+    if (end == -1) {
+        out.append("[]");
+        return;
+    }
+
+    SerialContext context = serializer.context;
+    serializer.setContext(context, object, fieldName, 0);
+
+    try {
+        Class<?> preClazz = null;
+        ObjectSerializer preWriter = null;
+        out.append('[');
+
+        if (out.isEnabled(SerializerFeature.PrettyFormat)) {
+            serializer.incrementIndent();
+            serializer.println();
+            for (int i = 0; i < size; ++i) {
+                if (i != 0) {
+                    out.write(',');
+                    serializer.println();
+                }
+                serializer.write(array[i]);
+            }
+            serializer.decrementIdent();
+            serializer.println();
+            out.write(']');
+            return;
+        }
+
+        for (int i = 0; i < end; ++i) {
+            Object item = array[i];
+
+            if (item == null) {
+                out.append("null,");
+            } else {
+                if (serializer.containsReference(item)) {
+                    serializer.writeReference(item);
+                } else {
+                    Class<?> clazz = item.getClass();
+
+                    if (!isClassAllowed(clazz)) {
+                        throw new SecurityException("Untrusted class detected: " + clazz.getName());
+                    }
+
+                    if (clazz == preClazz) {
+                        preWriter.write(serializer, item, null, null, 0);
+                    } else {
+                        preClazz = clazz;
+                        preWriter = serializer.getObjectWriter(clazz);
+                        preWriter.write(serializer, item, null, null, 0);
+                    }
+                }
+                out.append(',');
+            }
+        }
+
+        Object item = array[end];
+
+        if (item == null) {
+            out.append("null]");
+        } else {
+            if (serializer.containsReference(item)) {
+                serializer.writeReference(item);
+            } else {
+                Class<?> clazz = item.getClass();
+                if (!isClassAllowed(clazz)) {
+                    throw new SecurityException("Untrusted class detected: " + clazz.getName());
+                }
+                serializer.writeWithFieldName(item, end);
+            }
+            out.append(']');
+        }
+    } finally {
+        serializer.context = context;
+    }
+}
+
+private boolean isClassAllowed(Class<?> clazz) {
+    // Allow core Java classes, primitives, arrays, and explicitly trusted packages.
+    String className = clazz.getName();
+    return className.startsWith("java.") || 
+           className.startsWith("javax.") || 
+           className.startsWith("com.example.trusted") || 
+           clazz.isPrimitive() || 
+           clazz.isArray();
+}
+```
+</PatchedCode>
+
